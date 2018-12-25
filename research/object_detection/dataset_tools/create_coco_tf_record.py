@@ -25,7 +25,8 @@ Example usage:
       --train_annotations_file="${TRAIN_ANNOTATIONS_FILE}" \
       --val_annotations_file="${VAL_ANNOTATIONS_FILE}" \
       --testdev_annotations_file="${TESTDEV_ANNOTATIONS_FILE}" \
-      --output_dir="${OUTPUT_DIR}"
+      --output_dir="${OUTPUT_DIR}" \
+      --categories=[car,bus,truck]
 """
 from __future__ import absolute_import
 from __future__ import division
@@ -40,6 +41,7 @@ import numpy as np
 import PIL.Image
 
 from pycocotools import mask
+from pycocotools.coco import COCO
 import tensorflow as tf
 
 from object_detection.dataset_tools import tf_record_creation_util
@@ -64,6 +66,7 @@ tf.flags.DEFINE_string('val_annotations_file', '',
 tf.flags.DEFINE_string('testdev_annotations_file', '',
                        'Test-dev annotations JSON file.')
 tf.flags.DEFINE_string('output_dir', '/tmp/', 'Output data directory.')
+tf.flags.DEFINE_string('categories', '', 'List of COCO categories names')
 
 FLAGS = flags.FLAGS
 
@@ -134,6 +137,7 @@ def create_tf_example(image,
     if x + width > image_width or y + height > image_height:
       num_annotations_skipped += 1
       continue
+    
     xmin.append(float(x) / image_width)
     xmax.append(float(x + width) / image_width)
     ymin.append(float(y) / image_height)
@@ -192,17 +196,24 @@ def create_tf_example(image,
 
 
 def _create_tf_record_from_coco_annotations(
-    annotations_file, image_dir, output_path, include_masks, num_shards):
+    annotations_file, categories, image_dir, output_path, include_masks, num_shards):
   """Loads COCO annotation json files and converts to tf.Record format.
 
   Args:
     annotations_file: JSON file containing bounding box annotations.
+    categories: List of allowed COCO categories names (empty list allows all)
     image_dir: Directory containing the image files.
     output_path: Path to output tf.Record file.
     include_masks: Whether to include instance segmentations masks
       (PNG encoded) in the result. default: False.
     num_shards: number of output file shards.
   """
+  categories_ids = []
+  if categories:
+    coco = COCO(annotations_file)
+    categories_names = map(str, categories.strip('[]').split(','))
+    categories_ids = coco.getCatIds(catNms=categories_names)
+
   with contextlib2.ExitStack() as tf_record_close_stack, \
       tf.gfile.GFile(annotations_file, 'r') as fid:
     output_tfrecords = tf_record_creation_util.open_sharded_output_tfrecords(
@@ -231,17 +242,27 @@ def _create_tf_record_from_coco_annotations(
                     missing_annotation_count)
 
     total_num_annotations_skipped = 0
+    total_num_images_skipped = 0
+    total_annotations = 0
     for idx, image in enumerate(images):
       if idx % 100 == 0:
         tf.logging.info('On image %d of %d', idx, len(images))
       annotations_list = annotations_index[image['id']]
+      annotations = len(annotations_list)
+      total_annotations += annotations
+      if categories_ids:
+        annotations_list[:] = [ annotation for annotation in annotations_list if int(annotation['category_id']) in categories_ids ]
+        total_num_annotations_skipped += (annotations - len(annotations_list))
+      if not annotations_list:
+        total_num_images_skipped += 1
+        continue 
       _, tf_example, num_annotations_skipped = create_tf_example(
           image, annotations_list, image_dir, category_index, include_masks)
       total_num_annotations_skipped += num_annotations_skipped
       shard_idx = idx % num_shards
       output_tfrecords[shard_idx].write(tf_example.SerializeToString())
-    tf.logging.info('Finished writing, skipped %d annotations.',
-                    total_num_annotations_skipped)
+    tf.logging.info('Finished writing, skipped %d from %d annotations and skipped %d from %d images.',
+                    total_num_annotations_skipped, total_annotations, total_num_images_skipped, len(images))
 
 
 def main(_):
@@ -260,18 +281,21 @@ def main(_):
 
   _create_tf_record_from_coco_annotations(
       FLAGS.train_annotations_file,
+      FLAGS.categories,
       FLAGS.train_image_dir,
       train_output_path,
       FLAGS.include_masks,
       num_shards=100)
   _create_tf_record_from_coco_annotations(
       FLAGS.val_annotations_file,
+      FLAGS.categories,
       FLAGS.val_image_dir,
       val_output_path,
       FLAGS.include_masks,
       num_shards=10)
   _create_tf_record_from_coco_annotations(
       FLAGS.testdev_annotations_file,
+      FLAGS.categories,
       FLAGS.test_image_dir,
       testdev_output_path,
       FLAGS.include_masks,
